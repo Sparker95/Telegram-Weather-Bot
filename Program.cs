@@ -220,7 +220,7 @@ namespace TelegramWeatherBot {
     class Program {
 
         static int verMajor = 1;
-        static int verMinor = 2;
+        static int verMinor = 3;
 
         static HttpClient httpClient;
         static TelegramApi.Bot bot;
@@ -285,6 +285,7 @@ namespace TelegramWeatherBot {
             OpenWeatherApi.Forecast5Day forecast = openWeather.GetForecast5Day(httpClient, 55.7558, 37.6173);
             if (forecast == null) {
                 Logger.LogLine("OpenWeather API error!", false);
+                return;
             } else {
                 Logger.LogLine("ok", false);
                 Logger.LogLine("Forecast:");
@@ -294,14 +295,17 @@ namespace TelegramWeatherBot {
             Logger.LogLine("Hello from weather telegram bot!");
 
             while (true) {
-                GetUpdates();
+                bool successGetUpdates = GetUpdates();
+                if (!successGetUpdates) {
+                    Logger.LogLine("Error getting updates! Next attempt in 5 seconds.");
+                    Thread.Sleep(5000); // We don't want to spam their server with requests
+                }
                 CheckSubscriberAlerts();
-                Thread.Sleep(100);
             }
 
         }
 
-        static void GetUpdates() {
+        static bool GetUpdates() {
 
             TelegramApi.Update[] updates = bot.GetUpdates(httpClient);
 
@@ -312,8 +316,10 @@ namespace TelegramWeatherBot {
                         HandleUpdate(update);
                     }
                 }
+                return true;
             } else {
                 Logger.LogLine("Error getting updates");
+                return false;
             }
         }
 
@@ -397,6 +403,12 @@ namespace TelegramWeatherBot {
 
         static void SendForecastTo(Subscriber sub) {
             OpenWeatherApi.Forecast5Day forecast5 = openWeather.GetForecast5Day(httpClient, sub.lat, sub.lon);
+            
+            if (forecast5 == null) {
+                Logger.LogLine($"Error fetching forecast for {sub}");
+                return;
+            }
+            
             StringBuilder s = new StringBuilder(512);
             s.Append($"Forecast for: {sub.lat} {sub.lon}\n\n");
             for (uint i = 0; i < 8; i++) {
