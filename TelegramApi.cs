@@ -8,6 +8,8 @@ using System.Threading.Tasks;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
+using Logger = TelegramWeatherBot.Logger;
+
 namespace TelegramApi {
 
     class Bot {
@@ -49,8 +51,8 @@ namespace TelegramApi {
                 getTask.Wait();
 
                 TelegramApi.ResponseGetUpdates response = getTask.Result;
-                //Console.WriteLine("Result:");
-                //Console.WriteLine(resultStr);
+                //Logger.LogLine("Result:");
+                //Logger.LogLine(resultStr);
 
                 // Try to deserialize
                 if (response.ok) {
@@ -64,9 +66,54 @@ namespace TelegramApi {
                 }
             }
             catch (Exception e) {
-                Console.WriteLine($"Exception: {e}");
+                Logger.LogLine($"GetUpdates exception: {e}");
                 return null;
             }
+        }
+
+        public User GetMe(HttpClient httpClient) {
+            JsonSerializerOptions serializerOptions = new JsonSerializerOptions {
+                IncludeFields = true
+            };
+            try {
+                var task = httpClient.GetFromJsonAsync<ResponseGetMe>(this.MethodUrl("getMe"), serializerOptions);
+                task.Wait();
+                TelegramApi.ResponseGetMe response = task.Result;
+                if (response.ok) {
+                    return response.result;
+                } else {
+                    return null;
+                }
+            } catch (Exception e) {
+                Logger.LogLine($"GetMe exception: {e}");
+                return null;
+            }
+        }
+
+
+        // It blocks until HTTP transaction is over!
+        public void PostJsonSync(HttpClient httpClient, string method, Object obj) {
+            var serializerOptions = new JsonSerializerOptions {
+                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+                IncludeFields = true
+            };
+            var task = httpClient.PostAsync(
+                this.MethodUrl(method),
+                JsonContent.Create(
+                    obj,
+                    obj.GetType(),
+                    new System.Net.Http.Headers.MediaTypeHeaderValue("application/json"),
+                    serializerOptions)
+            );
+            task.Wait();
+        }
+
+        public void SendPlainMessage(HttpClient httpClient, long chatId, string text, bool disablePreview = false) {
+            TelegramApi.MethodSendMessage sendMsg = new TelegramApi.MethodSendMessage();
+            sendMsg.chat_id = chatId;
+            sendMsg.text = text;
+            sendMsg.disable_web_page_preview = disablePreview;
+            this.PostJsonSync(httpClient, "sendMessage", sendMsg);
         }
 
         // Extracts command from message string
@@ -138,7 +185,13 @@ namespace TelegramApi {
         public bool ok;
         public Update[] result;
         public string description;
-        public int testint;
+    }
+
+    public class ResponseGetMe {
+        public ResponseGetMe() { }
+        public bool ok;
+        public User result;
+        public string description;
     }
 
     public class KeyboardButton {

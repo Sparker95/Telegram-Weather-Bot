@@ -8,6 +8,8 @@ using System.Threading.Tasks;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
+using Logger = TelegramWeatherBot.Logger;
+
 namespace OpenWeatherApi {
     class Client {
         string token; // API key
@@ -17,24 +19,23 @@ namespace OpenWeatherApi {
             this.token = token;
         }
 
-        public string ForecastUrl() {
-            return $"{apiAddress}/data/2.5/forecast?q=Moscow&units=metric&appid={this.token}";
+        public string ForecastUrl(double lat, double lon) {
+            return $"{apiAddress}/data/2.5/forecast?lat={lat}&lon={lon}&units=metric&appid={this.token}";
         }
 
-        public Forecast5Day GetForecast5Day(HttpClient httpClient) {
+        public Forecast5Day GetForecast5Day(HttpClient httpClient, double lat, double lon) {
             JsonSerializerOptions serializerOptions = new JsonSerializerOptions {
                 IncludeFields = true
             };
 
-            string url = ForecastUrl();
+            string url = ForecastUrl(lat, lon);
             try {
                 var forecastTask = httpClient.GetFromJsonAsync<Forecast5Day>(url, serializerOptions);
                 forecastTask.Wait(); // todo
-                Console.WriteLine($"Received OpenWeather forecast: {forecastTask.Result.cnt} elements");
+                //Logger.LogLine($"Received OpenWeather forecast: {forecastTask.Result.cnt} elements");
                 return forecastTask.Result;
-            }
-            catch (Exception e) {
-                Console.WriteLine($"Exception: {e}");
+            } catch (Exception e) {
+                Logger.LogLine($"Exception: {e}");
                 return null;
             }
 
@@ -68,7 +69,7 @@ namespace OpenWeatherApi {
     }
 
     public class Forecast {
-        public ulong dt { get; set; }
+        public long dt { get; set; }
         public ForecastMain main { get; set; }
         public Weather[] weather { get; set; }
         public Clouds clouds { get; set; }

@@ -6,25 +6,35 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Collections.Generic;
 using System.Threading;
+using System.IO;
+using System.Text;
+
+//using Logger = TelegramWeatherBot.Logger;
 
 namespace TelegramWeatherBot {
 
     class Subscriber {
-        long id;            // Telegram user id
-        long chatId;        // Telegram chat id where to send message
-        double lat;          // Latitude for weather query
-        double lon;          // Longitude
-        uint alertHour;     // Time at which the alert will happen daily
-        uint alertMinute;
+        public long id;                // Telegram user id
+        public long chatId;            // Telegram chat id where to send message
+        public double lat;             // Latitude for weather query
+        public double lon;             // Longitude
+        public uint alertHour;         // Time at which the alert will happen daily
+        public uint alertMinute;
+        public int timeZone;           // Time zone, amount of hours offset from UTC
         long nextAlertUnixTime; // Unix time when next alert will happen
 
-        public Subscriber(long id, long chatId, double lat, double lon, uint alertHour, uint alertMinute) {
+        public Subscriber() {
+            this.UpdateNextAlertTime();
+        }
+
+        public Subscriber(long id, long chatId, double lat, double lon, uint alertHour, uint alertMinute, int timeZone) {
             this.id = id;
             this.chatId = chatId;
             this.alertHour = alertHour;
             this.alertMinute = alertMinute;
             this.lat = lat;
             this.lon = lon;
+            this.timeZone = timeZone;
             this.UpdateNextAlertTime();
         }
 
@@ -43,21 +53,38 @@ namespace TelegramWeatherBot {
 
         // Calculates Unix time of next alert
         public void UpdateNextAlertTime() {
-            DateTimeOffset now = DateTimeOffset.UtcNow;
-            DateTimeOffset currentAlert = new DateTimeOffset(now.Year, now.Month, now.Day, (int)this.alertHour, (int)this.alertMinute, 0, new TimeSpan(0));
-            while (now >= currentAlert) {
+            DateTimeOffset utcNow = DateTimeOffset.UtcNow;
+            var offset = new TimeSpan(this.timeZone, 0, 0);    // UTC time when user's alert will happen
+            DateTimeOffset currentAlert = new DateTimeOffset(utcNow.Year,
+                        utcNow.Month,
+                        utcNow.Day,
+                        (int)this.alertHour,
+                        (int)this.alertMinute,
+                        0, // Seconds
+                        offset);
+            while (utcNow >= currentAlert) {
                 currentAlert = currentAlert.AddDays(1); // Add one day until we're at the time of next alert
             }
             this.nextAlertUnixTime = currentAlert.ToUnixTimeSeconds();
         }
 
-        public bool AlertHasExpired(long unitTimeNow) {
-            return unitTimeNow >= this.nextAlertUnixTime;
+        public bool AlertHasExpired(long unixTimeNow) {
+            return unixTimeNow >= this.nextAlertUnixTime;
+        }
+
+        public TimeSpan TimeUntilAlert() {
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            return TimeSpan.FromSeconds(this.nextAlertUnixTime - now.ToUnixTimeSeconds());
+        }
+
+        public override string ToString() {
+            return $"{id} {chatId} {lat} {lon} {alertHour} {alertMinute} {timeZone}";
         }
     }
 
     abstract class Dialogue {
-        protected long userId;          // Telegram ID of the user
+        protected long chatId;          // Telegram chat ID
+        protected long userId;          // Telegram user ID
         private bool ended = false;  // If dialogue is marked as finished it will be cleared up later
         protected void EndDialogue() {
             this.ended = true;
@@ -65,13 +92,15 @@ namespace TelegramWeatherBot {
 
         public Dialogue() { }
 
-        public Dialogue(long userId) {
+        public Dialogue(long userId, long chatId) {
+            this.chatId = chatId;
             this.userId = userId;
         }
 
         // Public getters
         public bool Ended { get { return this.ended; } }
-        public long UserId { get { return userId;  } }
+        public long ChatId { get { return chatId; } }
+        public long UserId { get { return userId; } }
 
         // Override to handle user messages
         // The returned string is going to be sent back to user
@@ -81,12 +110,17 @@ namespace TelegramWeatherBot {
 
     class DialogueSubscribe : Dialogue {
 
+        public DialogueSubscribe(long userId, long chatId) : base(userId, chatId) { }
+
         enum State {
-            waitPos,       // Waiting for user to send city name
+            waitPos,        // Waiting for user to send city name
+            waitTimeZone,   // Waiting for user to send time zone
             waitAlertTime   // Waiting for user to send desired alert time
         }
 
         double lat, lon;
+        int timeZone;
+        uint alertHour, alertMinute;
         State state;
 
         public override TelegramApi.MethodSendMessage HandleStart() {
@@ -102,16 +136,35 @@ namespace TelegramWeatherBot {
                     string reply = null;
                     var parts = msg.Split(' ');
                     try {
-                        lat = Convert.ToDouble(parts[0]);
-                        lon = Convert.ToDouble(parts[1]);
+                        this.lat = Convert.ToDouble(parts[0]);
+                        this.lon = Convert.ToDouble(parts[1]);
                         if (lat <= -90.0 || lat > 90.0 || lon <= -180.0 || lon >= 180.0) {
                             throw new Exception("Coordinates are out of bounds");
                         }
-                        reply = $"Your coordinates are: {lat} {lon}\nPlease provide the time at which you want to receive the forecast in format HH:MM.\nFor example: 9:30";
+                        reply = $"What is your time zone?\nFor example: 3.";
+                        this.state = State.waitTimeZone;
+                    } catch (Exception e) {
+                        Logger.LogLine($"Error parsing coordinates: {e}");
+                        reply = "Provided coordinates are incorrect. Please try again.";
                     }
-                    catch (Exception e) {
-                        Console.WriteLine($"Error parsing coordinates: {e}");
-                        reply = "Your coordinates have wrong format. Please try again.";
+                    var sendMsg = new TelegramApi.MethodSendMessage();
+                    sendMsg.text = reply;
+                    return sendMsg;
+                    break;
+                }
+                case State.waitTimeZone: {
+                    string reply = null;
+                    try {
+                        this.timeZone = Convert.ToInt32(msg);
+                        if (timeZone < -12 || timeZone > 12) {
+                            throw new Exception("Time zone is out of bounds");
+                        }
+                        reply = $"What is the local time when you want to receive your forecasts?\nFor example: 9:30.";
+                        this.state = State.waitAlertTime;
+                    } catch (Exception e) {
+                        Logger.LogLine($"Error parsing time zone: {timeZone}");
+                        Logger.LogLine($"{e}");
+                        reply = "Provided time zone is incorrect. Please try again.";
                     }
                     var sendMsg = new TelegramApi.MethodSendMessage();
                     sendMsg.text = reply;
@@ -119,9 +172,44 @@ namespace TelegramWeatherBot {
                     break;
                 }
                 case State.waitAlertTime: {
+                    string reply = null;
+                    var parts = msg.Split(':', ' ');
+                    try {
+                        this.alertHour = Convert.ToUInt32(parts[0]);
+                        this.alertMinute = Convert.ToUInt32(parts[1]);
+                        if (alertHour >= 24 || alertMinute >= 60) {
+                            throw new Exception("Time format is incorrect");
+                        }
+                        Subscriber sub = new Subscriber(
+                            this.userId,
+                            this.chatId,
+                            this.lat, this.lon,
+                            this.alertHour, this.alertMinute,
+                            this.timeZone);
+                        Program.AddSubscriber(sub);
+                        TimeSpan timeUntilAlert = sub.TimeUntilAlert();
+                        int hours = timeUntilAlert.Hours;
+                        int minutes = timeUntilAlert.Minutes;
+                        StringBuilder sb = new StringBuilder(128);
+                        sb.AppendLine($"Your coordinates are: {lat} {lon}");
+                        sb.AppendLine($"Your time zone is: {timeZone}");
+                        sb.AppendLine($"You will receive daily updates at {this.alertHour}:{this.alertMinute}");
+                        sb.AppendLine($"Your next update will be in {hours} hours {minutes} minutes");
+                        sb.AppendLine($"Have a nice day!");
+                        reply = sb.ToString();
+                        this.EndDialogue();
+                    } catch(Exception e) {
+                        Logger.LogLine($"Error parsing time: {e}");
+                        reply = "Provided time is incorrect. Please try again.";
+                    }
+                    var sendMsg = new TelegramApi.MethodSendMessage();
+                    sendMsg.text = reply;
+                    return sendMsg;
                     break;
                 }
             }
+
+            return null;
         }
     }
 
@@ -131,62 +219,84 @@ namespace TelegramWeatherBot {
 
     class Program {
 
-        // todo: move this to external file
-        public const string botName = "SparkTest95Bot";
-        public const string botToken = "1711289807:AAGMNXL6dtCSAG00cCRC9wK05mWYi4-y3ZM";
-        public const string openWeatherToken = "84ca398bfecc5c94cb14466d9172ed54";
+        static int verMajor = 1;
+        static int verMinor = 2;
 
         static HttpClient httpClient;
         static TelegramApi.Bot bot;
         static OpenWeatherApi.Client openWeather;
         static JsonSerializerOptions serializerOptions;
 
-        static List<long> subscribers = new List<long>();
+        static Dictionary<long, Subscriber> subscribers = null;
         static Dictionary<long, Dialogue> dialogues = new Dictionary<long, Dialogue>();
 
         static void Main(string[] args) {
 
-            /*
-            var test0 = TelegramApi.GetCommand("/start");
-            var test1 = TelegramApi.GetCommand("/end");
-            var test2 = TelegramApi.GetCommand("whatever");
-            var test3 = TelegramApi.GetCommand("/doStuff@BotName");
-            var test4 = TelegramApi.GetCommand("/doStuff@SparkTest95Bot");
-            */
+            Logger.Init();  // Init file for logging
 
-            /*
-            Subscriber sub = new Subscriber(0, 0, 22, 30);
-            sub.UpdateNextAlertTime();
-            DateTimeOffset nextAlertTime = DateTimeOffset.FromUnixTimeSeconds(sub.timeNextAlert);
-            Console.WriteLine($"Current UTC time: {DateTimeOffset.UtcNow}");
-            Console.WriteLine($"Next UTC alert time: {nextAlertTime}");
-
-            return;
-            */
+            Logger.LogLine($"TelegramWeatherBot version {verMajor}.{verMinor}");
 
             serializerOptions = new JsonSerializerOptions {
                 IncludeFields = true,
                 DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
             };
 
-            TelegramApi.MethodSendMessage msgTest = new TelegramApi.MethodSendMessage();
-            msgTest.text = "123";
-            //msgTest.message = new TelegramApi.Message();
-            string msgTestSer = JsonSerializer.Serialize<TelegramApi.MethodSendMessage>(msgTest, serializerOptions);
-            Console.WriteLine(msgTestSer);
+
+            // Read keys from the file
+            string botToken, botName, openWeatherToken;
+            try {
+                Logger.Log("Reading keys.cfg ... ");
+                var cfgFileLines = File.ReadAllLines("keys.cfg");
+                botName = cfgFileLines[0];
+                botToken = cfgFileLines[1];
+                openWeatherToken = cfgFileLines[2];
+                Logger.LogLine("ok", false);
+            }
+            catch (Exception e) {
+                Logger.LogLine($"Error reading keys.cfg: {e}", false);
+                return;
+            }
+
+            // Read subscribers from the file
+            Logger.Log("Reading subscribers.json ... ");
+            LoadSubscribers();
+            Logger.LogLine("ok", false);
 
             httpClient = new HttpClient();
             httpClient.Timeout = TimeSpan.FromSeconds(10.0f);
             bot = new TelegramApi.Bot(botName, botToken);
             openWeather = new OpenWeatherApi.Client(openWeatherToken);
 
+            Logger.Log("Testing Telegram API connection ... ");
+            TelegramApi.User botUser = bot.GetMe(httpClient);
+            if (botUser == null) {
+                Logger.LogLine("Telegram API error!", false);
+                return;
+            } else {
+                Logger.LogLine("ok", false);
+                Logger.LogLine("Bot user data:");
+                Logger.LogLine($"  id: {botUser.id}");
+                Logger.LogLine($"  username: {botUser.username}");
+                Logger.LogLine($"  first_name: {botUser.first_name}");
+                Logger.LogLine($"  last_name: {botUser.last_name}");
+            }
 
+            Logger.Log("Testing OpenWeather connection ... ");
+            OpenWeatherApi.Forecast5Day forecast = openWeather.GetForecast5Day(httpClient, 55.7558, 37.6173);
+            if (forecast == null) {
+                Logger.LogLine("OpenWeather API error!", false);
+            } else {
+                Logger.LogLine("ok", false);
+                Logger.LogLine("Forecast:");
+                Logger.LogLine($"  temp: {forecast.list[0].main.temp} deg");
+            }
 
-            Console.WriteLine("Hello from telegram bot test!");
+            Logger.LogLine("Hello from weather telegram bot!");
 
             while (true) {
                 GetUpdates();
-                Thread.Sleep(500);
+                CheckSubscriberAlerts();
+                Thread.Sleep(100);
             }
 
         }
@@ -196,78 +306,119 @@ namespace TelegramWeatherBot {
             TelegramApi.Update[] updates = bot.GetUpdates(httpClient);
 
             if (updates != null) {
-                Console.WriteLine($"Received {updates.Length} updates:");
-                foreach (TelegramApi.Update update in updates) {
-                    HandleUpdate(update);
+                if (updates.Length > 0) {
+                    Logger.LogLine($"Received {updates.Length} updates:");
+                    foreach (TelegramApi.Update update in updates) {
+                        HandleUpdate(update);
+                    }
                 }
             } else {
-                Console.WriteLine("Error getting updates");
+                Logger.LogLine("Error getting updates");
             }
         }
 
         static void HandleUpdate(TelegramApi.Update update) {
             //
-            Console.WriteLine($"HandleUpdate: {update.update_id}");
+            Logger.LogLine($"HandleUpdate: {update.update_id}");
             if (update.message != null) {
                 if (update.message.text != null) {
-                    Console.WriteLine($"  Received msg: {update.message.text}");
+                    Logger.LogLine($"Received text from {update.message.from.id} {update.message.from.username} :\n{update.message.text}");
 
                     // Check what the message text was
                     string msgCmd = bot.GetCommand(update.message.text);
                     if (msgCmd != null) {
+
+                        // If we have received a command during a dialogue
+                        // then we must terminate the current dialogue
+                        if (dialogues.ContainsKey(update.message.chat.id)) {
+                            dialogues.Remove(update.message.chat.id);
+                        }
+
                         if (msgCmd.Equals("/start")) {
-                            long userId = update.message.chat.id;
-                            string userName = update.message.from.username;
-                            string textReply;
+                            bot.SendPlainMessage(httpClient, update.message.chat.id, "Hi from the weather bot! Please use one of the provided commands.");
 
-                            if (subscribers.Contains(userId)) {
-                                textReply = "You are already subscribed to this bot";
+                        } else if (msgCmd.Equals("/subscribe")) {
+                            var chatId = update.message.chat.id;
+                            Dialogue dialogue = new DialogueSubscribe(update.message.from.id, update.message.chat.id);
+                            InitDialogue(dialogue);
+
+                        } else if (msgCmd.Equals("/unsubscribe")) {
+                            RemoveSubscriber(update.message.from.id);
+                            bot.SendPlainMessage(httpClient, update.message.chat.id, "You have unsubscribed from the bot.");
+
+                        } else if (msgCmd.Equals("/forecast")) {
+                            Subscriber sub;
+                            subscribers.TryGetValue(update.message.from.id, out sub);
+                            if (sub != null) {
+                                SendForecastTo(sub);
                             } else {
-                                textReply = "You have just subscribed to this bot";
-                                Console.WriteLine($"User {userName} {userId} has subscribed");
+                                bot.SendPlainMessage(httpClient, update.message.chat.id, "You need to /subscribe first!");
                             }
-
-                            var args = new TelegramApi.MethodSendMessage {
-                                chat_id = update.message.chat.id,
-                                text = textReply
-                            };
-                            args.reply_markup = new TelegramApi.ReplyKeyboardRemove();
-                            var httpContent = JsonContent.Create<TelegramApi.MethodSendMessage>(args,
-                                new System.Net.Http.Headers.MediaTypeHeaderValue("application/json"),
-                                serializerOptions);
-                            var task = httpClient.PostAsync(bot.MethodUrl("sendMessage"), httpContent);
-                            task.Wait();
-
-                            subscribers.Add(update.message.chat.id);
-                        } else if (msgCmd.Equals("/test")) {
-                            var sendMsg = new TelegramApi.MethodSendMessage();
-                            sendMsg.chat_id = update.message.chat.id;
-                            sendMsg.text = "Hello hello hello";
-                            var mkup = new TelegramApi.ReplyKeyboardMarkup();
-                            var buttonLocation = new TelegramApi.KeyboardButton();
-                            buttonLocation.request_location = true;
-                            buttonLocation.text = "Where are you?";
-                            var buttonTest = new TelegramApi.KeyboardButton();
-                            buttonTest.text = "Test button";
-                            mkup.keyboard = new TelegramApi.KeyboardButton[2][];
-                            mkup.keyboard[0] = new TelegramApi.KeyboardButton[1];
-                            mkup.keyboard[1] = new TelegramApi.KeyboardButton[1];
-                            mkup.keyboard[0][0] = buttonLocation;
-                            mkup.keyboard[1][0] = buttonTest;
-                            sendMsg.reply_markup = mkup;
-                            var task = httpClient.PostAsync(
-                                bot.MethodUrl("sendMessage"),
-                                JsonContent.Create<TelegramApi.MethodSendMessage>(
-                                    sendMsg,
-                                    new System.Net.Http.Headers.MediaTypeHeaderValue("application/json"),
-                                    serializerOptions)
-                                );
-                            task.Wait();
-                            Console.WriteLine("Sent keyboard!");
+                        } else if (msgCmd.Equals("/info")) {
+                            Subscriber sub;
+                            subscribers.TryGetValue(update.message.from.id, out sub);
+                            string reply = null;
+                            if (sub != null) {
+                                StringBuilder sb = new StringBuilder(128);
+                                TimeSpan timeUntilAlert = sub.TimeUntilAlert();
+                                int hours = timeUntilAlert.Hours;
+                                int minutes = timeUntilAlert.Minutes;
+                                sb.AppendLine($"Your coordinates are: {sub.lat} {sub.lon}");
+                                sb.AppendLine($"Your time zone is: {sub.timeZone}");
+                                sb.AppendLine($"You will receive daily updates at {sub.alertHour}:{sub.alertMinute}");
+                                sb.AppendLine($"Your next update will be in {hours} hours {minutes} minutes");
+                                reply = sb.ToString();
+                            } else {
+                                reply = "You are not subscribed to this bot!";
+                            }
+                            bot.SendPlainMessage(httpClient, update.message.from.id, reply);
+                        }
+                    } else {
+                        // Received plain text, not a command
+                        // Check if it belongs to a dialogue
+                        Dialogue dialogue;
+                        dialogues.TryGetValue(update.message.chat.id, out dialogue);
+                        if (dialogue != null) {
+                            var sendMsgBack = dialogue.HandleMessage(update.message.text);
+                            if (sendMsgBack != null) {  // Send msg back to user
+                                sendMsgBack.chat_id = dialogue.ChatId;
+                                bot.PostJsonSync(httpClient, "sendMessage", sendMsgBack);
+                            }
+                            if (dialogue.Ended) {
+                                dialogues.Remove(update.message.chat.id);
+                            }
+                        } else {
+                            bot.SendPlainMessage(httpClient, update.message.chat.id, "What's going on??");
                         }
                     }
                 }
             }
+        }
+
+        static void SendForecastTo(Subscriber sub) {
+            OpenWeatherApi.Forecast5Day forecast5 = openWeather.GetForecast5Day(httpClient, sub.lat, sub.lon);
+            StringBuilder s = new StringBuilder(512);
+            s.Append($"Forecast for: {sub.lat} {sub.lon}\n\n");
+            for (uint i = 0; i < 8; i++) {
+                s.Append(FormatForecast(forecast5.list[i], sub.timeZone));
+                s.Append("\n");
+            }
+            s.Append("Data provided by https://openweathermap.org");
+            bot.SendPlainMessage(httpClient, sub.chatId, s.ToString(), true);
+            Logger.LogLine($"Sent forecast to {sub.id}");
+        }
+
+        static string FormatForecast(OpenWeatherApi.Forecast f, int timeZone) {
+            StringBuilder s = new StringBuilder(128);
+            DateTime d = DateTimeOffset.FromUnixTimeSeconds(f.dt).DateTime;
+            d.AddHours((double)timeZone);
+            d.AddHours(timeZone);
+            s.Append($"Date:    {d}\n");
+            s.Append($"Temp:    {(int)Math.Round(f.main.temp)} deg.c\n");
+            s.Append($"Wind:    {(int)Math.Round(f.wind.speed)} m/s, Gusts: {(int)Math.Round(f.wind.gust)} m/s\n");
+            s.Append($"Weather: {f.weather[0].main} - {f.weather[0].description}\n");
+            s.Append($"POP:     {(int)f.pop*100.0f} %\n");
+            return s.ToString();
         }
 
         static void InitDialogue(Dialogue dialogue) {
@@ -276,11 +427,65 @@ namespace TelegramWeatherBot {
             
             // Send message back to user if requested
             if (sendMsg != null) {
-
+                sendMsg.chat_id = dialogue.ChatId;
+                bot.PostJsonSync(httpClient, "sendMessage", sendMsg);
             }
 
             // Add to the list of dialogues
-            dialogues.Add(dialogue.UserId, dialogue);
+            dialogues.Add(dialogue.ChatId, dialogue);
         }
+
+        static void CheckSubscriberAlerts() {
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            long unixTime = now.ToUnixTimeSeconds();
+            foreach (KeyValuePair<long, Subscriber> p in subscribers) {
+                Subscriber sub = p.Value;
+                if (sub.AlertHasExpired(unixTime)) {
+                    SendForecastTo(sub);
+                    sub.UpdateNextAlertTime();
+                }
+            }
+        }
+
+        public static void AddSubscriber(Subscriber sub) {
+            RemoveSubscriber(sub.id);   // Remove subscriber if he already exists
+            subscribers.Add(sub.id, sub);
+            SaveSubscribers();
+            Logger.LogLine($"Added subscriber: {sub}");
+        }
+
+        public static void RemoveSubscriber(long userId) {
+            if (subscribers.ContainsKey(userId)) {
+                subscribers.Remove(userId);
+                SaveSubscribers();
+                Logger.LogLine($"Removed subscriber: {userId}");
+            }
+        }
+
+        static void SaveSubscribers() {
+            JsonSerializerOptions opts = new JsonSerializerOptions {
+                IncludeFields = true,
+                WriteIndented = true
+            };
+
+            string subSerialized = JsonSerializer.Serialize<Dictionary<long, Subscriber>>(subscribers, opts);
+            File.WriteAllText("subscribers.json", subSerialized);
+        }
+
+        static void LoadSubscribers() {
+            JsonSerializerOptions opts = new JsonSerializerOptions {
+                IncludeFields = true
+            };
+
+            try {
+                string subSerialized = File.ReadAllText("subscribers.json");
+                subscribers = JsonSerializer.Deserialize<Dictionary<long, Subscriber>>(subSerialized, opts);
+            }
+            catch (FileNotFoundException e) {
+                subscribers = new Dictionary<long, Subscriber>();
+            }
+        }
+
+
     }
 }
