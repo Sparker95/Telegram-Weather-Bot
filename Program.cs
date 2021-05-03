@@ -68,6 +68,11 @@ namespace TelegramWeatherBot {
             this.nextAlertUnixTime = currentAlert.ToUnixTimeSeconds();
         }
 
+        // Adds given amount of seconds to alert time
+        public void IncreaseAlertTime(int seconds) {
+            this.nextAlertUnixTime += seconds;
+        }
+
         public bool AlertHasExpired(long unixTimeNow) {
             return unixTimeNow >= this.nextAlertUnixTime;
         }
@@ -220,7 +225,7 @@ namespace TelegramWeatherBot {
     class Program {
 
         static int verMajor = 1;
-        static int verMinor = 3;
+        static int verMinor = 4;
 
         static HttpClient httpClient;
         static TelegramApi.Bot bot;
@@ -356,7 +361,7 @@ namespace TelegramWeatherBot {
                             Subscriber sub;
                             subscribers.TryGetValue(update.message.from.id, out sub);
                             if (sub != null) {
-                                SendForecastTo(sub);
+                                TrySendForecastTo(sub);
                             } else {
                                 bot.SendPlainMessage(httpClient, update.message.chat.id, "You need to /subscribe first!");
                             }
@@ -401,12 +406,12 @@ namespace TelegramWeatherBot {
             }
         }
 
-        static void SendForecastTo(Subscriber sub) {
+        static bool TrySendForecastTo(Subscriber sub) {
             OpenWeatherApi.Forecast5Day forecast5 = openWeather.GetForecast5Day(httpClient, sub.lat, sub.lon);
             
             if (forecast5 == null) {
                 Logger.LogLine($"Error fetching forecast for {sub}");
-                return;
+                return false;
             }
             
             StringBuilder s = new StringBuilder(512);
@@ -417,7 +422,7 @@ namespace TelegramWeatherBot {
             }
             s.Append("Data provided by https://openweathermap.org");
             bot.SendPlainMessage(httpClient, sub.chatId, s.ToString(), true);
-            Logger.LogLine($"Sent forecast to {sub.id}");
+            return true;
         }
 
         static string FormatForecast(OpenWeatherApi.Forecast f, int timeZone) {
@@ -453,8 +458,14 @@ namespace TelegramWeatherBot {
             foreach (KeyValuePair<long, Subscriber> p in subscribers) {
                 Subscriber sub = p.Value;
                 if (sub.AlertHasExpired(unixTime)) {
-                    SendForecastTo(sub);
-                    sub.UpdateNextAlertTime();
+                    bool sendSuccess = TrySendForecastTo(sub);
+                    if (sendSuccess) {
+                        sub.UpdateNextAlertTime();  // Send next alert tomorrow
+                        Logger.LogLine($"Sent forecast to {sub.id}");
+                    } else {
+                        sub.IncreaseAlertTime(10);  // Try again a few seconds later
+                        Logger.LogLine($"Failed to send forecast to {sub.id}. Trying again in 10 seconds.");
+                    }
                 }
             }
         }
